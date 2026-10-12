@@ -51,7 +51,7 @@ git rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1 || { echo "error
 # PR state by branch, fetched once. Empty if gh is unavailable.
 prs=$(mktemp)
 gh pr list --author "@me" --state all --limit 1000 \
-	--json number,state,headRefName 2>/dev/null > "$prs" || echo "[]" > "$prs"
+	--json number,state,headRefName,headRefOid 2>/dev/null > "$prs" || echo "[]" > "$prs"
 
 # Transcripts dir: ~/.cursor/projects/<slugified-repo-path>/agent-transcripts.
 slug=$(printf '%s' "$main_wt" | sed 's#^/##; s#/#-#g')
@@ -86,10 +86,15 @@ git worktree list --porcelain | awk '/^worktree /{print $2}' | while read -r wt;
 		[ "$(git -C "$wt" rev-parse "origin/$branch" 2>/dev/null)" = "$head" ] \
 			&& remote=pushed \
 			|| remote="ahead$(git -C "$wt" rev-list --count "origin/$branch..HEAD" 2>/dev/null)"
+		[ "$remote" = ahead0 ] && remote=behind
 	else remote=no-remote; fi
 
-	pr=$([ -n "$branch" ] && jq -r --arg b "$branch" \
-		'.[] | select(.headRefName==$b) | "#\(.number)/\(.state)"' "$prs" 2>/dev/null | head -1)
+	# Several PRs can share a branch name; prefer the one whose head is HEAD.
+	pr_record=$([ -n "$branch" ] && jq -r --arg b "$branch" --arg h "$head" \
+		'[.[] | select(.headRefName==$b)] | (map(select(.headRefOid==$h)) + .)[0]
+		| select(.) | "#\(.number)/\(.state)\t\(.headRefOid // "")"' "$prs" 2>/dev/null)
+	pr=${pr_record%%$'\t'*}
+	pr_head=${pr_record#*$'\t'}
 	[ -z "$pr" ] && pr="-"
 
 	# Most recent chat whose transcript operated in this worktree. Match path
@@ -103,12 +108,13 @@ git worktree list --porcelain | awk '/^worktree /{print $2}' | while read -r wt;
 	fi
 	recent=$([ "$last_ts" -gt 0 ] 2>/dev/null && [ $(( (now - last_ts) / 86400 )) -le 4 ] && echo yes || echo no)
 
-	# Commits that exist only in this worktree (ahead of the remote, no remote
-	# branch, or detached) are gone with it. Only ancestry of the base or a
-	# MERGED PR proves the work lives elsewhere; a CLOSED PR proves nothing.
+	# An exact PR head proves the commits were pushed even if origin has no
+	# branch (deleted after merging, or hosted on a fork). A CLOSED PR still
+	# proves nothing about whether those commits were merged.
 	case "$pr" in *MERGED*) pr_merged=yes ;; *) pr_merged=no ;; esac
 	case "$remote" in ahead*|no-remote|detached) unpushed=yes ;; *) unpushed=no ;; esac
 	[ "$merged" = YES ] && unpushed=no
+	[ -n "$pr_head" ] && [ "$head" = "$pr_head" ] && unpushed=no
 
 	case "$dirty" in wip:*) bucket=hold-wip ;; *)
 		case "$pr" in *OPEN*) bucket=hold-open-pr ;; *)
